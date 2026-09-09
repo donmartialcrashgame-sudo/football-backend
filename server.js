@@ -3,8 +3,11 @@ const cors = require('cors');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
-const API_KEY = process.env.API_SPORTS_KEY || process.env.FOOTBALL_API_KEY;
-const API_BASE_URL = process.env.FOOTBALL_API_BASE_URL || 'https://v3.football.api-sports.io';
+
+// The Odds API is used only as the football match/event source for Betvora.
+// Keep the API key server-side in Render environment variables.
+const ODDS_API_KEY = process.env.ODDS_API_KEY;
+const ODDS_API_BASE_URL = process.env.ODDS_API_BASE_URL || 'https://api.the-odds-api.com/v4';
 
 app.use(cors());
 app.use(express.json());
@@ -12,34 +15,29 @@ app.use(express.json());
 app.get('/', (_req, res) => {
   res.json({
     ok: true,
-    service: 'football-backend',
-    message: 'Football API backend is running',
-    footballApiConfigured: Boolean(API_KEY)
+    service: 'betvora-football-backend',
+    message: 'Betvora football backend is running',
+    oddsApiConfigured: Boolean(ODDS_API_KEY)
   });
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'football-backend' });
+  res.json({ ok: true, service: 'betvora-football-backend' });
 });
 
-async function footballRequest(path) {
-  if (!API_KEY) {
-    const error = new Error('Football API key is not configured. Add API_SPORTS_KEY in Render environment variables.');
+async function oddsApiRequest(path, query = {}) {
+  if (!ODDS_API_KEY) {
+    const error = new Error('Odds API key is not configured. Add ODDS_API_KEY in Render environment variables.');
     error.status = 500;
     throw error;
   }
 
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    headers: {
-      'x-apisports-key': API_KEY,
-      'Accept': 'application/json'
-    }
-  });
-
+  const params = new URLSearchParams({ apiKey: ODDS_API_KEY, ...query });
+  const response = await fetch(`${ODDS_API_BASE_URL}${path}?${params}`);
   const data = await response.json();
 
   if (!response.ok) {
-    const error = new Error(`Football provider returned HTTP ${response.status}`);
+    const error = new Error(`Odds provider returned HTTP ${response.status}`);
     error.status = response.status;
     error.provider = data;
     throw error;
@@ -48,103 +46,63 @@ async function footballRequest(path) {
   return data;
 }
 
-app.get('/api/football/status', async (_req, res) => {
+// List available sports from The Odds API.
+app.get('/api/odds/sports', async (_req, res) => {
   try {
-    const data = await footballRequest('/status');
+    res.json(await oddsApiRequest('/sports'));
+  } catch (error) {
+    res.status(error.status || 500).json({ ok: false, error: error.message, provider: error.provider || null });
+  }
+});
+
+// Fetch football/soccer events. This route intentionally does not use
+// bookmaker odds; Betvora's own odds engine/WebSocket will handle pricing.
+app.get('/api/odds/football', async (req, res) => {
+  try {
+    const sport = String(req.query.sport || 'soccer');
+    const query = {};
+
+    if (req.query.dateFormat) query.dateFormat = String(req.query.dateFormat);
+    if (req.query.daysFrom) query.daysFrom = String(req.query.daysFrom);
+
+    // The API requires a region/markets selection when requesting odds.
+    // For fixture discovery, use the scores/events endpoint below instead.
+    const data = await oddsApiRequest(`/sports/${encodeURIComponent(sport)}/events`, query);
     res.json(data);
   } catch (error) {
     res.status(error.status || 500).json({ ok: false, error: error.message, provider: error.provider || null });
   }
 });
 
-app.get('/api/football/countries', async (_req, res) => {
+// Upcoming/live football scores and event state. Useful for matching the
+// WebSocket odds engine to the correct event IDs.
+app.get('/api/odds/football/scores', async (req, res) => {
   try {
-    res.json(await footballRequest('/countries'));
+    const sport = String(req.query.sport || 'soccer');
+    const query = {};
+    if (req.query.daysFrom) query.daysFrom = String(req.query.daysFrom);
+    if (req.query.dateFormat) query.dateFormat = String(req.query.dateFormat);
+
+    const data = await oddsApiRequest(`/sports/${encodeURIComponent(sport)}/scores`, query);
+    res.json(data);
   } catch (error) {
     res.status(error.status || 500).json({ ok: false, error: error.message, provider: error.provider || null });
   }
 });
 
-app.get('/api/football/leagues', async (req, res) => {
+// Event-specific fixture lookup. The returned event ID can be used by the
+// Betvora odds engine as its stable match reference.
+app.get('/api/odds/event/:id', async (req, res) => {
   try {
-    const params = new URLSearchParams();
-    for (const key of ['id', 'name', 'country', 'code', 'season', 'type', 'current', 'search']) {
-      if (req.query[key]) params.set(key, String(req.query[key]));
-    }
-    res.json(await footballRequest(`/leagues${params.toString() ? `?${params}` : ''}`));
-  } catch (error) {
-    res.status(error.status || 500).json({ ok: false, error: error.message, provider: error.provider || null });
-  }
-});
+    const sport = String(req.query.sport || 'soccer');
+    const events = await oddsApiRequest(`/sports/${encodeURIComponent(sport)}/events`, {});
+    const event = events.find((item) => String(item.id) === String(req.params.id));
 
-app.get('/api/football/fixtures', async (req, res) => {
-  try {
-    const params = new URLSearchParams();
-    const fixtureKeys = ['id', 'live', 'date', 'league', 'season', 'team', 'last', 'next', 'from', 'to', 'status', 'timezone'];
-
-    for (const key of fixtureKeys) {
-      if (req.query[key]) params.set(key, String(req.query[key]));
-    }
-
-    // If no fixture parameter was supplied, return today's fixtures in Africa/Lagos.
-    if (params.toString() === '') {
-      const timezone = 'Africa/Lagos';
-      const date = new Intl.DateTimeFormat('en-CA', {
-        timeZone: timezone,
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit'
-      }).format(new Date());
-
-      params.set('date', date);
-      params.set('timezone', timezone);
+    if (!event) {
+      return res.status(404).json({ ok: false, error: 'Football event not found' });
     }
 
-    res.json(await footballRequest(`/fixtures?${params}`));
-  } catch (error) {
-    res.status(error.status || 500).json({ ok: false, error: error.message, provider: error.provider || null });
-  }
-});
-
-app.get('/api/football/today', async (req, res) => {
-  try {
-    const timezone = String(req.query.timezone || 'Africa/Lagos');
-    const date = String(req.query.date || new Intl.DateTimeFormat('en-CA', {
-      timeZone: timezone,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit'
-    }).format(new Date()));
-    const params = new URLSearchParams({ date, timezone });
-    res.json(await footballRequest(`/fixtures?${params}`));
-  } catch (error) {
-    res.status(error.status || 500).json({ ok: false, error: error.message, provider: error.provider || null });
-  }
-});
-
-app.get('/api/football/live', async (_req, res) => {
-  try {
-    res.json(await footballRequest('/fixtures?live=all'));
-  } catch (error) {
-    res.status(error.status || 500).json({ ok: false, error: error.message, provider: error.provider || null });
-  }
-});
-
-app.get('/api/football/fixture/:id', async (req, res) => {
-  try {
-    res.json(await footballRequest(`/fixtures?id=${encodeURIComponent(req.params.id)}`));
-  } catch (error) {
-    res.status(error.status || 500).json({ ok: false, error: error.message, provider: error.provider || null });
-  }
-});
-
-app.get('/api/football/standings', async (req, res) => {
-  try {
-    const params = new URLSearchParams();
-    for (const key of ['league', 'season', 'team']) {
-      if (req.query[key]) params.set(key, String(req.query[key]));
-    }
-    res.json(await footballRequest(`/standings?${params}`));
+    res.json(event);
   } catch (error) {
     res.status(error.status || 500).json({ ok: false, error: error.message, provider: error.provider || null });
   }
@@ -160,7 +118,7 @@ app.use((error, _req, res, _next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Football backend listening on port ${PORT}`);
-  console.log(`Football provider: ${API_BASE_URL}`);
-  console.log(`Football API key configured: ${Boolean(API_KEY)}`);
+  console.log(`Betvora football backend listening on port ${PORT}`);
+  console.log(`Odds provider: ${ODDS_API_BASE_URL}`);
+  console.log(`Odds API key configured: ${Boolean(ODDS_API_KEY)}`);
 });
