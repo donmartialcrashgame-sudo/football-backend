@@ -4,10 +4,10 @@ const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-// The Odds API is used as Betvora's football match/event source.
-// Betvora's own WebSocket odds engine will handle displayed pricing later.
-const ODDS_API_KEY = process.env.ODDS_API_KEY;
-const ODDS_API_BASE_URL = process.env.ODDS_API_BASE_URL || 'https://api.the-odds-api.com/v4';
+// API-Football / API-Sports configuration.
+// Keep the real key only in Render environment variables.
+const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY;
+const API_FOOTBALL_BASE_URL = process.env.API_FOOTBALL_BASE_URL || 'https://v3.football.api-sports.io';
 
 app.use(cors());
 app.use(express.json());
@@ -16,191 +16,243 @@ app.get('/', (_req, res) => {
   res.json({
     ok: true,
     service: 'betvora-football-backend',
+    provider: 'API-Football',
     message: 'Betvora football backend is running',
-    oddsApiConfigured: Boolean(ODDS_API_KEY)
+    apiFootballConfigured: Boolean(API_FOOTBALL_KEY)
   });
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'betvora-football-backend' });
+  res.json({
+    ok: true,
+    service: 'betvora-football-backend',
+    provider: 'API-Football',
+    apiFootballConfigured: Boolean(API_FOOTBALL_KEY)
+  });
 });
 
-async function oddsApiRequest(path, query = {}) {
-  if (!ODDS_API_KEY) {
-    const error = new Error('Odds API key is not configured. Add ODDS_API_KEY in Render environment variables.');
+async function footballRequest(path, query = {}) {
+  if (!API_FOOTBALL_KEY) {
+    const error = new Error('API-Football key is not configured. Add API_FOOTBALL_KEY in Render environment variables.');
     error.status = 500;
     throw error;
   }
 
-  const params = new URLSearchParams({ apiKey: ODDS_API_KEY, ...query });
-  const response = await fetch(`${ODDS_API_BASE_URL}${path}?${params}`);
-  const data = await response.json();
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== null && value !== '') params.set(key, String(value));
+  }
+
+  const url = `${API_FOOTBALL_BASE_URL}${path}${params.toString() ? `?${params}` : ''}`;
+  const response = await fetch(url, {
+    headers: {
+      'x-apisports-key': API_FOOTBALL_KEY,
+      'Accept': 'application/json'
+    }
+  });
+
+  let data;
+  try {
+    data = await response.json();
+  } catch (_error) {
+    data = null;
+  }
 
   if (!response.ok) {
-    const error = new Error(`Odds provider returned HTTP ${response.status}`);
+    const error = new Error(`API-Football returned HTTP ${response.status}`);
     error.status = response.status;
     error.provider = data;
     throw error;
   }
 
-  return data;
+  if (data && data.errors && Object.keys(data.errors).length > 0) {
+    const error = new Error('API-Football returned an API error');
+    error.status = 502;
+    error.provider = data.errors;
+    throw error;
+  }
+
+  return data || { get: path, parameters: query, errors: {}, results: 0, response: [] };
 }
 
-// The Odds API requires an exact sport key such as soccer_epl.
-// Never assume that "soccer" is a valid sport key.
-async function getSoccerSports() {
-  const sports = await oddsApiRequest('/sports');
-  return sports.filter((sport) =>
-    sport.group === 'Soccer' &&
-    sport.active === true &&
-    sport.has_outrights !== true
-  );
+function handleError(res, error) {
+  res.status(error.status || 500).json({
+    ok: false,
+    error: error.message,
+    provider: error.provider || null
+  });
 }
 
-// List every currently available sport from The Odds API.
+// -----------------------------------------------------------------------------
+// API-Football routes used by Betvora
+// -----------------------------------------------------------------------------
+
+// Football competitions. Optional: ?country=Nigeria or ?season=2026
+app.get('/api/football/leagues', async (req, res) => {
+  try {
+    const query = {};
+    if (req.query.id) query.id = req.query.id;
+    if (req.query.name) query.name = req.query.name;
+    if (req.query.country) query.country = req.query.country;
+    if (req.query.code) query.code = req.query.code;
+    if (req.query.season) query.season = req.query.season;
+    res.json(await footballRequest('/leagues', query));
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+// Fixtures. Examples:
+// /api/football/fixtures?league=39&season=2026
+// /api/football/fixtures?date=2026-09-09
+// /api/football/fixtures?next=20
+app.get('/api/football/fixtures', async (req, res) => {
+  try {
+    const allowed = [
+      'id', 'ids', 'live', 'date', 'league', 'season', 'team', 'last',
+      'next', 'from', 'to', 'round', 'status', 'timezone'
+    ];
+    const query = {};
+    for (const key of allowed) {
+      if (req.query[key] !== undefined) query[key] = req.query[key];
+    }
+    res.json(await footballRequest('/fixtures', query));
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+// Current live fixtures.
+app.get('/api/football/live', async (req, res) => {
+  try {
+    const query = { live: 'all' };
+    if (req.query.league) query.league = req.query.league;
+    if (req.query.season) query.season = req.query.season;
+    if (req.query.timezone) query.timezone = req.query.timezone;
+    res.json(await footballRequest('/fixtures', query));
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+// Teams. Example: /api/football/teams?league=39&season=2026
+app.get('/api/football/teams', async (req, res) => {
+  try {
+    const query = {};
+    if (req.query.id) query.id = req.query.id;
+    if (req.query.name) query.name = req.query.name;
+    if (req.query.league) query.league = req.query.league;
+    if (req.query.season) query.season = req.query.season;
+    if (req.query.country) query.country = req.query.country;
+    res.json(await footballRequest('/teams', query));
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+// League standings.
+app.get('/api/football/standings', async (req, res) => {
+  try {
+    const query = {};
+    if (req.query.league) query.league = req.query.league;
+    if (req.query.season) query.season = req.query.season;
+    if (req.query.team) query.team = req.query.team;
+    res.json(await footballRequest('/standings', query));
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+// Match events: goals, cards, substitutions, VAR, etc.
+app.get('/api/football/events', async (req, res) => {
+  try {
+    if (!req.query.fixture) {
+      return res.status(400).json({ ok: false, error: 'fixture is required' });
+    }
+    const query = { fixture: req.query.fixture };
+    if (req.query.team) query.team = req.query.team;
+    res.json(await footballRequest('/fixtures/events', query));
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+// Match statistics.
+app.get('/api/football/statistics', async (req, res) => {
+  try {
+    if (!req.query.fixture) {
+      return res.status(400).json({ ok: false, error: 'fixture is required' });
+    }
+    const query = { fixture: req.query.fixture };
+    if (req.query.team) query.team = req.query.team;
+    res.json(await footballRequest('/fixtures/statistics', query));
+  } catch (error) {
+    handleError(res, error);
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Compatibility routes for the current Betvora frontend.
+// These now return API-Football data instead of The Odds API data.
+// -----------------------------------------------------------------------------
+
 app.get('/api/odds/sports', async (_req, res) => {
   try {
-    res.json(await oddsApiRequest('/sports'));
+    res.json((await footballRequest('/leagues')).response || []);
   } catch (error) {
-    res.status(error.status || 500).json({
-      ok: false,
-      error: error.message,
-      provider: error.provider || null
-    });
+    handleError(res, error);
   }
 });
 
-// List only active soccer competitions with their real API sport keys.
-app.get('/api/odds/football/leagues', async (_req, res) => {
+app.get('/api/odds/football/leagues', async (req, res) => {
   try {
-    const leagues = await getSoccerSports();
-    res.json(leagues);
+    const query = {};
+    if (req.query.country) query.country = req.query.country;
+    if (req.query.season) query.season = req.query.season;
+    res.json((await footballRequest('/leagues', query)).response || []);
   } catch (error) {
-    res.status(error.status || 500).json({
-      ok: false,
-      error: error.message,
-      provider: error.provider || null
-    });
+    handleError(res, error);
   }
 });
 
-// Fetch events for one exact sport key.
-// Example: /api/odds/football?sport=soccer_epl
+// Keep the existing frontend endpoint alive. `sport` can now be an API-Football
+// league ID (for example 39 for the Premier League), while no sport returns
+// upcoming fixtures from API-Football.
 app.get('/api/odds/football', async (req, res) => {
   try {
-    const requestedSport = req.query.sport ? String(req.query.sport) : null;
     const query = {};
-
-    if (req.query.dateFormat) query.dateFormat = String(req.query.dateFormat);
-    if (req.query.commenceTimeFrom) query.commenceTimeFrom = String(req.query.commenceTimeFrom);
-    if (req.query.commenceTimeTo) query.commenceTimeTo = String(req.query.commenceTimeTo);
-
-    if (requestedSport) {
-      const data = await oddsApiRequest(`/sports/${encodeURIComponent(requestedSport)}/events`, query);
-      return res.json(data);
-    }
-
-    // No league supplied: collect events from all active soccer competitions.
-    // The /events endpoint does not consume usage quota.
-    const soccerSports = await getSoccerSports();
-    const results = await Promise.all(
-      soccerSports.map(async (sport) => {
-        const events = await oddsApiRequest(`/sports/${encodeURIComponent(sport.key)}/events`, query);
-        return events.map((event) => ({
-          ...event,
-          sport_key: event.sport_key || sport.key,
-          sport_title: event.sport_title || sport.title
-        }));
-      })
-    );
-
-    const events = results
-      .flat()
-      .sort((a, b) => new Date(a.commence_time) - new Date(b.commence_time));
-
-    res.json(events);
+    if (req.query.sport) query.league = req.query.sport;
+    if (req.query.season) query.season = req.query.season;
+    if (req.query.date) query.date = req.query.date;
+    if (req.query.from) query.from = req.query.from;
+    if (req.query.to) query.to = req.query.to;
+    if (!query.league && !query.date && !query.next && !query.last) query.next = 20;
+    res.json((await footballRequest('/fixtures', query)).response || []);
   } catch (error) {
-    res.status(error.status || 500).json({
-      ok: false,
-      error: error.message,
-      provider: error.provider || null
-    });
+    handleError(res, error);
   }
 });
 
-// Fetch scores for one exact sport key.
-// Example: /api/odds/football/scores?sport=soccer_epl
 app.get('/api/odds/football/scores', async (req, res) => {
   try {
-    const requestedSport = req.query.sport ? String(req.query.sport) : null;
-    const query = {};
-
-    if (req.query.daysFrom) query.daysFrom = String(req.query.daysFrom);
-    if (req.query.dateFormat) query.dateFormat = String(req.query.dateFormat);
-
-    if (requestedSport) {
-      const data = await oddsApiRequest(`/sports/${encodeURIComponent(requestedSport)}/scores`, query);
-      return res.json(data);
-    }
-
-    // Scores are only supported for selected sports. If no sport is supplied,
-    // try all active soccer competitions and keep successful responses.
-    const soccerSports = await getSoccerSports();
-    const results = await Promise.allSettled(
-      soccerSports.map((sport) => oddsApiRequest(`/sports/${encodeURIComponent(sport.key)}/scores`, query))
-    );
-
-    const scores = results
-      .filter((result) => result.status === 'fulfilled')
-      .flatMap((result) => result.value);
-
-    scores.sort((a, b) => new Date(a.commence_time) - new Date(b.commence_time));
-    res.json(scores);
+    const query = { live: 'all' };
+    if (req.query.sport) query.league = req.query.sport;
+    if (req.query.season) query.season = req.query.season;
+    res.json((await footballRequest('/fixtures', query)).response || []);
   } catch (error) {
-    res.status(error.status || 500).json({
-      ok: false,
-      error: error.message,
-      provider: error.provider || null
-    });
+    handleError(res, error);
   }
 });
 
-// Find an event across a supplied sport or, if no sport is supplied, across
-// all active soccer competitions.
+// Find a fixture by ID.
 app.get('/api/odds/event/:id', async (req, res) => {
   try {
-    const eventId = String(req.params.id);
-    const requestedSport = req.query.sport ? String(req.query.sport) : null;
-
-    if (requestedSport) {
-      const events = await oddsApiRequest(`/sports/${encodeURIComponent(requestedSport)}/events`, {});
-      const event = events.find((item) => String(item.id) === eventId);
-
-      if (!event) {
-        return res.status(404).json({ ok: false, error: 'Football event not found' });
-      }
-
-      return res.json(event);
-    }
-
-    const soccerSports = await getSoccerSports();
-    const results = await Promise.allSettled(
-      soccerSports.map((sport) => oddsApiRequest(`/sports/${encodeURIComponent(sport.key)}/events`, {}))
-    );
-
-    for (const result of results) {
-      if (result.status !== 'fulfilled') continue;
-      const event = result.value.find((item) => String(item.id) === eventId);
-      if (event) return res.json(event);
-    }
-
-    res.status(404).json({ ok: false, error: 'Football event not found' });
+    const data = await footballRequest('/fixtures', { id: req.params.id });
+    const fixture = (data.response || [])[0];
+    if (!fixture) return res.status(404).json({ ok: false, error: 'Football fixture not found' });
+    res.json(fixture);
   } catch (error) {
-    res.status(error.status || 500).json({
-      ok: false,
-      error: error.message,
-      provider: error.provider || null
-    });
+    handleError(res, error);
   }
 });
 
@@ -215,6 +267,6 @@ app.use((error, _req, res, _next) => {
 
 app.listen(PORT, () => {
   console.log(`Betvora football backend listening on port ${PORT}`);
-  console.log(`Odds provider: ${ODDS_API_BASE_URL}`);
-  console.log(`Odds API key configured: ${Boolean(ODDS_API_KEY)}`);
+  console.log(`Football provider: ${API_FOOTBALL_BASE_URL}`);
+  console.log(`API-Football key configured: ${Boolean(API_FOOTBALL_KEY)}`);
 });
