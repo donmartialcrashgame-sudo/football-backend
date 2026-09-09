@@ -80,10 +80,27 @@ app.get('/api/football/leagues', async (req, res) => {
 app.get('/api/football/fixtures', async (req, res) => {
   try {
     const params = new URLSearchParams();
-    for (const key of ['id', 'live', 'date', 'league', 'season', 'team', 'last', 'next', 'from', 'to', 'status', 'timezone']) {
+    const fixtureKeys = ['id', 'live', 'date', 'league', 'season', 'team', 'last', 'next', 'from', 'to', 'status', 'timezone'];
+
+    for (const key of fixtureKeys) {
       if (req.query[key]) params.set(key, String(req.query[key]));
     }
-    res.json(await footballRequest(`/fixtures${params.toString() ? `?${params}` : ''}`));
+
+    // If no fixture parameter was supplied, return today's fixtures in Africa/Lagos.
+    if (params.toString() === '') {
+      const timezone = 'Africa/Lagos';
+      const date = new Intl.DateTimeFormat('en-CA', {
+        timeZone: timezone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+      }).format(new Date());
+
+      params.set('date', date);
+      params.set('timezone', timezone);
+    }
+
+    res.json(await footballRequest(`/fixtures?${params}`));
   } catch (error) {
     res.status(error.status || 500).json({ ok: false, error: error.message, provider: error.provider || null });
   }
@@ -92,7 +109,12 @@ app.get('/api/football/fixtures', async (req, res) => {
 app.get('/api/football/today', async (req, res) => {
   try {
     const timezone = String(req.query.timezone || 'Africa/Lagos');
-    const date = String(req.query.date || new Date().toISOString().slice(0, 10));
+    const date = String(req.query.date || new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).format(new Date()));
     const params = new URLSearchParams({ date, timezone });
     res.json(await footballRequest(`/fixtures?${params}`));
   } catch (error) {
